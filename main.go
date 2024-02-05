@@ -1,4 +1,5 @@
 package main
+
 /*
 ./serf -bindAddr 127.0.0.1 -bindPort 6666 -advertiseAddr 127.0.0.1 -advertisePort 6666 -clusterAddr 127.0.0.1 -clusterPort 6666 -name a1
 ./serf -bindAddr 127.0.0.1 -bindPort 7777 -advertiseAddr 127.0.0.1 -advertisePort 7777 -clusterAddr 127.0.0.1 -clusterPort 6666 -name a2
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/hashicorp/logutils"
 	"github.com/hashicorp/serf/serf"
 	"github.com/pkg/errors"
 )
@@ -40,9 +42,18 @@ type CRDT struct {
 
 // setupCluster initializes and joins a Serf cluster.
 func setupCluster(config ClusterConfig) (*serf.Serf, *CRDT, error) {
+
+	filter := &logutils.LevelFilter{
+		Levels:   []logutils.LogLevel{"DEBUG", "INFO", "WARN", "ERROR"},
+		MinLevel: logutils.LogLevel("INFO"),
+		Writer:   os.Stderr,
+	}
+
 	// Initialize Serf configuration
 	conf := serf.DefaultConfig()
 	conf.Init()
+	conf.MemberlistConfig.LogOutput = filter
+	conf.LogOutput = filter
 
 	// Set Memberlist configuration
 	conf.MemberlistConfig.AdvertiseAddr = config.AdvertiseAddr
@@ -74,6 +85,7 @@ func setupCluster(config ClusterConfig) (*serf.Serf, *CRDT, error) {
 
 // main function
 func main() {
+
 	// Parse command-line flags for cluster configuration
 	config := parseFlags()
 
