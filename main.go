@@ -206,13 +206,24 @@ func handleUserEvent(event serf.UserEvent, crdt *CRDT) {
 	}
 }
 
+/ MarshalTags is a utility function which takes a map of tag key/value pairs
+// and returns the same tags as strings in 'key=value' format.
+func MarshalTags(tags map[string]string) []string {
+	var result []string
+	for name, value := range tags {
+		result = append(result, fmt.Sprintf("%s=%s", name, value))
+	}
+	return result
+}
+
 // listMembers prints a list of all servers connected to the cluster.
 func listMembers(cluster *serf.Serf) {
 	members := cluster.Members()
 	fmt.Println("Connected Servers:")
 	for _, member := range members {
 		if member.Status != serf.StatusLeft {
-			fmt.Printf("  %s (%s)\n", member.Name, member.Addr.String())
+
+			fmt.Printf("  %s %s %s\n", member.Name, member.Addr.String(), MarshalTags(member.Tags))
 		}
 	}
 }
