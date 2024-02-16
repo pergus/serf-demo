@@ -3,6 +3,7 @@ module serf-demo
 go 1.22.0
 
 require (
+	github.com/chzyer/readline v1.5.1
 	github.com/hashicorp/logutils v1.0.0
 	github.com/hashicorp/serf v0.10.1
 	github.com/pkg/errors v0.9.1

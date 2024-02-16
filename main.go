@@ -1,12 +1,12 @@
-package main
-
 /*
-./serf -bindAddr 127.0.0.1 -bindPort 6666 -advertiseAddr 127.0.0.1 -advertisePort 6666 -clusterAddr 127.0.0.1 -clusterPort 6666 -name a1
-./serf -bindAddr 127.0.0.1 -bindPort 7777 -advertiseAddr 127.0.0.1 -advertisePort 7777 -clusterAddr 127.0.0.1 -clusterPort 6666 -name a2
+./serf-demo -bindAddr 127.0.0.1 -bindPort 6666 -name a1
+./serf-demo -bindAddr 127.0.0.1 -bindPort 7777 -clusterAddr 127.0.0.1 -clusterPort 6666 -name a2
 */
 
+package main
+
 import (
-	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -16,7 +16,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/chzyer/readline"
 	"github.com/hashicorp/logutils"
 	"github.com/hashicorp/serf/serf"
 	"github.com/pkg/errors"
@@ -33,12 +35,14 @@ type ClusterConfig struct {
 	Name          string
 }
 
-var events chan serf.Event
+var events chan serf.Event   // Surf events
+var exitSignal chan struct{} // Channel to signal exit
 
 // CRDT represents a simple Counter CRDT.
 type CRDT struct {
-	mu      sync.Mutex
-	counter int
+	mu    sync.Mutex
+	value int
+	clock int
 }
 
 // setupCluster initializes and joins a Serf cluster.
@@ -96,8 +100,14 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Initialize the exit signal channel
+	exitSignal = make(chan struct{})
+
 	// Set up a signal channel to handle interrupts and termination signals
 	go waitForSignal()
+
+	// Start the background goroutine to periodically exchange CRDT data
+	go exchangeCRDTData(cluster, counterCRDT)
 
 	// Start the REPL for interacting with the Serf cluster
 	go startREPL(cluster, counterCRDT)
@@ -112,8 +122,6 @@ func parseFlags() ClusterConfig {
 
 	flag.StringVar(&config.BindAddr, "bindAddr", "127.0.0.1", "Address for the agent to listen for incoming connections")
 	flag.StringVar(&config.BindPort, "bindPort", "6666", "Port for the agent to listen for incoming connections")
-	flag.StringVar(&config.AdvertiseAddr, "advertiseAddr", "127.0.0.1", "Address for the agent to be reachable")
-	flag.StringVar(&config.AdvertisePort, "advertisePort", "6666", "Port for the agent to be reachable")
 	flag.StringVar(&config.ClusterAddr, "clusterAddr", "127.0.0.1", "Address of the first agent in the cluster")
 	flag.StringVar(&config.ClusterPort, "clusterPort", "6666", "Port of the first agent in the cluster")
 	flag.StringVar(&config.Name, "name", "default", "Unique name for the agent in the cluster")
@@ -125,40 +133,70 @@ func parseFlags() ClusterConfig {
 
 // waitForSignal sets up a signal channel to handle interrupts and termination signals.
 func waitForSignal() {
-	c := make(chan os.Signal, 2)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 }
 
 // startREPL initiates the REPL for interacting with the Serf cluster.
 func startREPL(cluster *serf.Serf, crdt *CRDT) {
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:       "> ",
+		EOFPrompt:    "exit",
+		HistoryFile:  "/tmp/readline.tmp",
+		AutoComplete: &commandCompleter{},
+	})
+	if err != nil {
+		fmt.Println("Error creating readline instance: ", err)
+		return
+	}
+	defer rl.Close()
+
 	fmt.Println("Welcome to the Serf Cluster REPL. Type 'help' for available commands.")
 
-	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Print("> ")
-		scanner.Scan()
-		command := scanner.Text()
+		line, err := rl.Readline()
+		if err != nil {
+			break
+		}
 
-		switch command {
+		switch strings.TrimSpace(line) {
 		case "help":
 			fmt.Println("Available commands:")
-			fmt.Println("  list - List all servers connected to the cluster")
-			fmt.Println("  edit-crdt - Increment the counter CRDT and distribute it to all nodes")
-			fmt.Println("  show-crdt - Show the current value of the counter CRDT")
-			fmt.Println("  exit - Exit the REPL")
-		case "list":
+			fmt.Println("  members   - List all servers connected to the cluster")
+			fmt.Println("  crdt-edit - Increment the counter CRDT and distribute it to all nodes")
+			fmt.Println("  crdt-show - Show the current value of the counter CRDT")
+			fmt.Println("  exit      - Exit the REPL")
+		case "members":
 			listMembers(cluster)
-		case "edit-crdt":
+		case "crdt-edit":
 			editCRDT(cluster, crdt)
-		case "show-crdt":
+		case "crdt-show":
 			showCRDT(crdt)
 		case "exit":
 			fmt.Println("Exiting the REPL. Leaving the Serf cluster gracefully.")
 			cluster.Leave()
-			os.Exit(0)
+			close(exitSignal)
+			return
 		default:
 			fmt.Println("Unknown command. Type 'help' for available commands.")
+		}
+	}
+}
+
+// exchangeCRDTData periodically sends the CRDT value to other nodes in the cluster.
+func exchangeCRDTData(cluster *serf.Serf, crdt *CRDT) {
+	ticker := time.NewTicker(5 * time.Second) // Adjust the interval as needed
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Broadcast the current CRDT value to all nodes in the cluster
+			broadcastUpdate(cluster, crdt)
+		case <-exitSignal: // Check if exitSignal channel is closed
+			fmt.Println("Exiting exchangeCRDTData goroutine.")
+			return // Exit the goroutine
 		}
 	}
 }
@@ -175,6 +213,9 @@ func handleUserEvents(cluster *serf.Serf, crdt *CRDT) {
 				userEvent := e.(serf.UserEvent)
 				handleUserEvent(userEvent, crdt)
 			}
+		case <-exitSignal: // Check if exitSignal channel is closed
+			fmt.Println("Exiting handleUserEvents goroutine.")
+			return // Exit the goroutine
 		}
 	}
 }
@@ -195,21 +236,29 @@ func handleMemberUpdate(event serf.Event, crdt *CRDT) {
 // handleUserEvent processes the received user event.
 func handleUserEvent(event serf.UserEvent, crdt *CRDT) {
 	if event.Name == "crdt-update" {
-		payload := event.Payload
-		value, err := strconv.Atoi(string(payload))
-		if err != nil {
-			fmt.Printf("Error converting CRDT update payload: %v\n", err)
+		// Decode the JSON payload into a map[string]int
+		var data map[string]int
+		if err := json.Unmarshal(event.Payload, &data); err != nil {
+			fmt.Printf("Error decoding CRDT update payload: %v\n", err)
 			return
 		}
 
-		crdt.setValue(value)
-		fmt.Printf("Received CRDT update. New value: %d\n", value)
+		// Extract clock and value from the decoded data
+		clock := data["clock"]
+		value := data["value"]
+
+		// Update the CRDT with the decoded values
+		if clock > crdt.clock {
+			crdt.setValue(clock, value)
+			fmt.Printf("Received CRDT update. New clock: %d, New value: %d\n", clock, value)
+		}
+
 	}
 }
 
-// MarshalTags is a utility function which takes a map of tag key/value pairs
+// marshalTags is a utility function which takes a map of tag key/value pairs
 // and returns the same tags as strings in 'key=value' format.
-func MarshalTags(tags map[string]string) []string {
+func marshalTags(tags map[string]string) []string {
 	var result []string
 	for name, value := range tags {
 		result = append(result, fmt.Sprintf("%s=%s", name, value))
@@ -217,14 +266,14 @@ func MarshalTags(tags map[string]string) []string {
 	return result
 }
 
-// UnmarshalTags is a utility function which takes a slice of strings in
+// unmarshalTags is a utility function which takes a slice of strings in
 // key=value format and returns them as a tag mapping.
-func UnmarshalTags(tags []string) (map[string]string, error) {
+func unmarshalTags(tags []string) (map[string]string, error) {
 	result := make(map[string]string)
 	for _, tag := range tags {
 		parts := strings.SplitN(tag, "=", 2)
 		if len(parts) != 2 || len(parts[0]) == 0 {
-			return nil, fmt.Errorf("Invalid tag: '%s'", tag)
+			return nil, fmt.Errorf("invalid tag: '%s'", tag)
 		}
 		result[parts[0]] = parts[1]
 	}
@@ -237,8 +286,7 @@ func listMembers(cluster *serf.Serf) {
 	fmt.Println("Connected Servers:")
 	for _, member := range members {
 		if member.Status != serf.StatusLeft {
-
-			fmt.Printf("  %s %s %s\n", member.Name, member.Addr.String(), MarshalTags(member.Tags))
+			fmt.Printf("  %s\n", member.Name)
 		}
 	}
 }
@@ -260,12 +308,20 @@ func editCRDT(cluster *serf.Serf, crdt *CRDT) {
 
 // broadcastUpdate sends a broadcast message to all nodes in the cluster with the updated CRDT value.
 func broadcastUpdate(cluster *serf.Serf, crdt *CRDT) {
-	event := serf.UserEvent{
-		Name:    "crdt-update",
-		Payload: []byte(strconv.Itoa(crdt.getValue())),
+
+	// Marshal CRDT values to JSON
+	data, err := json.Marshal(map[string]int{"clock": crdt.getClock(), "value": crdt.getValue()})
+	if err != nil {
+		fmt.Printf("Error marshaling CRDT data: %v\n", err)
+		return
 	}
 
-	err := cluster.UserEvent(event.Name, event.Payload, true)
+	event := serf.UserEvent{
+		Name:    "crdt-update",
+		Payload: data,
+	}
+
+	err = cluster.UserEvent(event.Name, event.Payload, true)
 	if err != nil {
 		fmt.Printf("Error broadcasting CRDT update: %v\n", err)
 	} else {
@@ -277,17 +333,60 @@ func broadcastUpdate(cluster *serf.Serf, crdt *CRDT) {
 func (c *CRDT) increment() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.counter++
+	c.clock++
+	c.value = c.value + 2
 }
 
-func (c *CRDT) setValue(value int) {
+func (c *CRDT) setValue(clock int, value int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.counter = value
+	c.clock = clock
+	c.value = value
 }
 
 func (c *CRDT) getValue() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.counter
+	return c.value
+}
+
+func (c *CRDT) getClock() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.clock
+}
+
+// commandCompleter is a custom completer struct for readline.
+type commandCompleter struct{}
+
+func (c *commandCompleter) Do(line []rune, pos int) (newLine [][]rune, length int) {
+	// Discard anything after the cursor position.
+	// This is similar behaviour to shell/bash.
+	prefix := string(line[:pos])
+	var suggestions [][]rune
+	words := []string{"help", "members", "crdt-edit", "crdt-show", "exit"}
+
+	// Simple hack to allow auto completion for help.
+	if len(words) > 0 && words[0] == "help" {
+		words = words[1:]
+	}
+
+	if len(prefix) > 0 {
+		for _, cmd := range words {
+			if strings.HasPrefix(cmd, prefix) {
+				suggestions = append(suggestions, []rune(strings.TrimPrefix(cmd, prefix)))
+			}
+		}
+	} else {
+		for _, cmd := range words {
+			suggestions = append(suggestions, []rune(cmd))
+		}
+	}
+
+	// Append an empty space to each suggestions.
+	for i, s := range suggestions {
+		suggestions[i] = append(s, ' ')
+	}
+
+	return suggestions, len(prefix)
 }
