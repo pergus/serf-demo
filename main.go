@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -206,7 +207,7 @@ func handleUserEvent(event serf.UserEvent, crdt *CRDT) {
 	}
 }
 
-/ MarshalTags is a utility function which takes a map of tag key/value pairs
+// MarshalTags is a utility function which takes a map of tag key/value pairs
 // and returns the same tags as strings in 'key=value' format.
 func MarshalTags(tags map[string]string) []string {
 	var result []string
