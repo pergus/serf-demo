@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -37,6 +38,10 @@ type ClusterConfig struct {
 
 var events chan serf.Event   // Surf events
 var exitSignal chan struct{} // Channel to signal exit
+
+const (
+	portFilePath = "port.txt"
+)
 
 // CRDT represents a simple Counter CRDT.
 type CRDT struct {
@@ -88,9 +93,84 @@ func setupCluster(config ClusterConfig) (*serf.Serf, *CRDT, error) {
 	return cluster, counterCRDT, nil
 }
 
+func IPv4() net.IP {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	localAddress := conn.LocalAddr().(*net.UDPAddr)
+
+	return localAddress.IP
+}
+
+func Hostname() string {
+	name, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+
+	return name
+}
+
+func Port(bindPort int) int {
+	// Check if the port file exists
+	if _, err := os.Stat(portFilePath); err == nil {
+		// Port file exists, read its content
+		port, err := readPortFromFile()
+		if err != nil {
+			return 0
+		}
+		return port
+	} else if os.IsNotExist(err) {
+		// Write the port to the file
+		err = writePortToFile(bindPort)
+		if err != nil {
+			return 0
+		}
+		return bindPort
+	} else {
+		return 0
+	}
+}
+
+// readPortFromFile reads the port number from the port file
+func readPortFromFile() (int, error) {
+	content, err := os.ReadFile(portFilePath)
+	if err != nil {
+		return 0, err
+	}
+	port, err := strconv.Atoi(string(content))
+	if err != nil {
+		return 0, err
+	}
+	return port, nil
+}
+
+// getAvailablePort requests an available port from the OS
+func getAvailablePort() int {
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		return 0
+	}
+	defer l.Close()
+	addr := l.Addr().(*net.TCPAddr)
+	return addr.Port
+}
+
+// writePortToFile writes the port number to the port file
+func writePortToFile(port int) error {
+	content := []byte(strconv.Itoa(port))
+	err := os.WriteFile(portFilePath, content, 0644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 // main function
 func main() {
-
 	// Parse command-line flags for cluster configuration
 	config := parseFlags()
 
@@ -120,11 +200,17 @@ func main() {
 func parseFlags() ClusterConfig {
 	var config ClusterConfig
 
-	flag.StringVar(&config.BindAddr, "bindAddr", "127.0.0.1", "Address for the agent to listen for incoming connections")
-	flag.StringVar(&config.BindPort, "bindPort", "6666", "Port for the agent to listen for incoming connections")
-	flag.StringVar(&config.ClusterAddr, "clusterAddr", "127.0.0.1", "Address of the first agent in the cluster")
-	flag.StringVar(&config.ClusterPort, "clusterPort", "6666", "Port of the first agent in the cluster")
-	flag.StringVar(&config.Name, "name", "default", "Unique name for the agent in the cluster")
+	bindAddr := IPv4().String()
+	bindPort := getAvailablePort()
+	bindPortStr := strconv.Itoa(bindPort)
+	clusterPort := strconv.Itoa(Port(bindPort))
+	host := fmt.Sprintf("%v-%v", Hostname(), bindPortStr)
+
+	flag.StringVar(&config.BindAddr, "bindAddr", bindAddr, "Address for the agent to listen for incoming connections")
+	flag.StringVar(&config.BindPort, "bindPort", bindPortStr, "Port for the agent to listen for incoming connections")
+	flag.StringVar(&config.ClusterAddr, "clusterAddr", bindAddr, "Address of the first agent in the cluster")
+	flag.StringVar(&config.ClusterPort, "clusterPort", clusterPort, "Port of the first agent in the cluster")
+	flag.StringVar(&config.Name, "name", host, "Unique name for the agent in the cluster")
 
 	flag.Parse()
 
@@ -324,9 +410,12 @@ func broadcastUpdate(cluster *serf.Serf, crdt *CRDT) {
 	err = cluster.UserEvent(event.Name, event.Payload, true)
 	if err != nil {
 		fmt.Printf("Error broadcasting CRDT update: %v\n", err)
-	} else {
-		fmt.Println("CRDT update broadcasted successfully.")
 	}
+	/*
+		else {
+			fmt.Println("CRDT update broadcasted successfully.")
+		}
+	*/
 }
 
 // CRDT methods

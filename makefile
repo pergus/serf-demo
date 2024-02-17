@@ -2,5 +2,7 @@
 
 build:
 	go mod tidy
-	go build
+	CGO_ENABLED=0 go build -ldflags="-s -w"
+
+run:
 	./serf-demo
