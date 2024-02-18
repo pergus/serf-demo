@@ -1,6 +1,13 @@
 /*
-./serf-demo -bindAddr 127.0.0.1 -bindPort 6666 -name a1
-./serf-demo -bindAddr 127.0.0.1 -bindPort 7777 -clusterAddr 127.0.0.1 -clusterPort 6666 -name a2
+serf-demo -bindAddr 127.0.0.1 -bindPort 6666 -name a1
+serf-demo -bindAddr 127.0.0.1 -bindPort 7777 -clusterAddr 127.0.0.1 -clusterPort 6666 -name a2
+
+alt.
+
+serf-demo -name a1
+Use the info command on a1 to get the cluster port for the next command:
+serf-demo -name a2 -clusterPort 57158
+
 */
 
 package main
@@ -13,6 +20,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"serf-demo/table"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,21 +35,15 @@ import (
 
 // ClusterConfig holds the configuration parameters for setting up a Serf cluster.
 type ClusterConfig struct {
-	BindAddr      string
-	BindPort      string
-	AdvertiseAddr string
-	AdvertisePort string
-	ClusterAddr   string
-	ClusterPort   string
-	Name          string
+	BindAddr    string
+	BindPort    string
+	ClusterAddr string
+	ClusterPort string
+	Name        string
 }
 
 var events chan serf.Event   // Surf events
 var exitSignal chan struct{} // Channel to signal exit
-
-const (
-	portFilePath = "port.txt"
-)
 
 // CRDT represents a simple Counter CRDT.
 type CRDT struct {
@@ -55,7 +57,7 @@ func setupCluster(config ClusterConfig) (*serf.Serf, *CRDT, error) {
 
 	filter := &logutils.LevelFilter{
 		Levels:   []logutils.LogLevel{"DEBUG", "INFO", "WARN", "ERROR"},
-		MinLevel: logutils.LogLevel("INFO"),
+		MinLevel: logutils.LogLevel("ERROR"),
 		Writer:   os.Stderr,
 	}
 
@@ -66,8 +68,9 @@ func setupCluster(config ClusterConfig) (*serf.Serf, *CRDT, error) {
 	conf.LogOutput = filter
 
 	// Set Memberlist configuration
-	conf.MemberlistConfig.AdvertiseAddr = config.AdvertiseAddr
-	conf.MemberlistConfig.AdvertisePort, _ = strconv.Atoi(config.AdvertisePort)
+	conf.MemberlistConfig.AdvertiseAddr = config.BindAddr
+	conf.MemberlistConfig.AdvertisePort, _ = strconv.Atoi(config.BindPort)
+
 	conf.MemberlistConfig.BindAddr = config.BindAddr
 	conf.MemberlistConfig.BindPort, _ = strconv.Atoi(config.BindPort)
 	conf.MemberlistConfig.ProtocolVersion = 3 // Version 3 enables binding different ports for each agent
@@ -114,42 +117,8 @@ func Hostname() string {
 	return name
 }
 
-func Port(bindPort int) int {
-	// Check if the port file exists
-	if _, err := os.Stat(portFilePath); err == nil {
-		// Port file exists, read its content
-		port, err := readPortFromFile()
-		if err != nil {
-			return 0
-		}
-		return port
-	} else if os.IsNotExist(err) {
-		// Write the port to the file
-		err = writePortToFile(bindPort)
-		if err != nil {
-			return 0
-		}
-		return bindPort
-	} else {
-		return 0
-	}
-}
-
-// readPortFromFile reads the port number from the port file
-func readPortFromFile() (int, error) {
-	content, err := os.ReadFile(portFilePath)
-	if err != nil {
-		return 0, err
-	}
-	port, err := strconv.Atoi(string(content))
-	if err != nil {
-		return 0, err
-	}
-	return port, nil
-}
-
-// getAvailablePort requests an available port from the OS
-func getAvailablePort() int {
+// availablePort requests an available port from the OS
+func availablePort() int {
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		return 0
@@ -157,16 +126,6 @@ func getAvailablePort() int {
 	defer l.Close()
 	addr := l.Addr().(*net.TCPAddr)
 	return addr.Port
-}
-
-// writePortToFile writes the port number to the port file
-func writePortToFile(port int) error {
-	content := []byte(strconv.Itoa(port))
-	err := os.WriteFile(portFilePath, content, 0644)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 // main function
@@ -190,7 +149,7 @@ func main() {
 	go exchangeCRDTData(cluster, counterCRDT)
 
 	// Start the REPL for interacting with the Serf cluster
-	go startREPL(cluster, counterCRDT)
+	go startREPL(config, cluster, counterCRDT)
 
 	// Handle user and member events
 	handleUserEvents(cluster, counterCRDT)
@@ -201,9 +160,9 @@ func parseFlags() ClusterConfig {
 	var config ClusterConfig
 
 	bindAddr := IPv4().String()
-	bindPort := getAvailablePort()
+	bindPort := availablePort()
 	bindPortStr := strconv.Itoa(bindPort)
-	clusterPort := strconv.Itoa(Port(bindPort))
+	clusterPort := strconv.Itoa(bindPort)
 	host := fmt.Sprintf("%v-%v", Hostname(), bindPortStr)
 
 	flag.StringVar(&config.BindAddr, "bindAddr", bindAddr, "Address for the agent to listen for incoming connections")
@@ -225,7 +184,7 @@ func waitForSignal() {
 }
 
 // startREPL initiates the REPL for interacting with the Serf cluster.
-func startREPL(cluster *serf.Serf, crdt *CRDT) {
+func startREPL(config ClusterConfig, cluster *serf.Serf, crdt *CRDT) {
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:       "> ",
 		EOFPrompt:    "exit",
@@ -243,18 +202,25 @@ func startREPL(cluster *serf.Serf, crdt *CRDT) {
 	for {
 		line, err := rl.Readline()
 		if err != nil {
+			cluster.Leave()
+			close(exitSignal)
 			break
 		}
 
 		switch strings.TrimSpace(line) {
 		case "help":
 			fmt.Println("Available commands:")
+			fmt.Println("  host      - List information about the host.")
 			fmt.Println("  members   - List all servers connected to the cluster")
 			fmt.Println("  crdt-edit - Increment the counter CRDT and distribute it to all nodes")
 			fmt.Println("  crdt-show - Show the current value of the counter CRDT")
 			fmt.Println("  exit      - Exit the REPL")
+		case "host":
+			listHost(config)
 		case "members":
 			listMembers(cluster)
+		case "info":
+			listInfo(config, cluster)
 		case "crdt-edit":
 			editCRDT(cluster, crdt)
 		case "crdt-show":
@@ -312,10 +278,12 @@ func handleMemberUpdate(event serf.Event, crdt *CRDT) {
 	case serf.EventMemberJoin:
 		member := event.(serf.MemberEvent).Members[0]
 		fmt.Printf("Member joined: %s\n", member.Name)
-	case serf.EventMemberLeave, serf.EventMemberFailed:
+	case serf.EventMemberLeave:
 		member := event.(serf.MemberEvent).Members[0]
-		fmt.Printf("Member left or failed: %s\n", member.Name)
-		// You may want to handle CRDT adjustment or other actions here if needed
+		fmt.Printf("Member left: %s\n", member.Name)
+	case serf.EventMemberFailed:
+		member := event.(serf.MemberEvent).Members[0]
+		fmt.Printf("Member failed: %s\n", member.Name)
 	}
 }
 
@@ -366,15 +334,31 @@ func unmarshalTags(tags []string) (map[string]string, error) {
 	return result, nil
 }
 
+// listInfo print host configuration and cluster memebers.
+func listInfo(config ClusterConfig, cluster *serf.Serf) {
+	listHost(config)
+	listMembers(cluster)
+}
+
+// listInfo print host configuratio.
+func listHost(config ClusterConfig) {
+	hostTable := table.NewTableWriter("Host")
+	hostTable.AddHeaders("Name", "Bind Address", "Bind Port", "Cluster Address", "Cluster Port")
+	hostTable.AddRow(config.Name, config.BindAddr, config.BindPort, config.ClusterAddr, config.ClusterPort)
+	fmt.Println(hostTable.Render())
+}
+
 // listMembers prints a list of all servers connected to the cluster.
 func listMembers(cluster *serf.Serf) {
-	members := cluster.Members()
-	fmt.Println("Connected Servers:")
-	for _, member := range members {
-		if member.Status != serf.StatusLeft {
-			fmt.Printf("  %s\n", member.Name)
+	membersTable := table.NewTableWriter("Members")
+	membersTable.AddHeaders("Name", "Address", "Port")
+
+	for _, m := range cluster.Members() {
+		if m.Status != serf.StatusLeft {
+			membersTable.AddRow(m.Name, m.Addr, m.Port)
 		}
 	}
+	fmt.Println(membersTable.Render())
 }
 
 // showCRDT prints the current value of the counter CRDT.
@@ -411,11 +395,6 @@ func broadcastUpdate(cluster *serf.Serf, crdt *CRDT) {
 	if err != nil {
 		fmt.Printf("Error broadcasting CRDT update: %v\n", err)
 	}
-	/*
-		else {
-			fmt.Println("CRDT update broadcasted successfully.")
-		}
-	*/
 }
 
 // CRDT methods
@@ -453,7 +432,7 @@ func (c *commandCompleter) Do(line []rune, pos int) (newLine [][]rune, length in
 	// This is similar behaviour to shell/bash.
 	prefix := string(line[:pos])
 	var suggestions [][]rune
-	words := []string{"help", "members", "crdt-edit", "crdt-show", "exit"}
+	words := []string{"help", "host", "info", "members", "crdt-edit", "crdt-show", "exit"}
 
 	// Simple hack to allow auto completion for help.
 	if len(words) > 0 && words[0] == "help" {
